@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,11 +31,25 @@ func main() {
 
 			stats := pinger.Statistics()
 			if stats.PacketsRecv > 0 {
-				fmt.Printf("Device found: %s\n", targetIP)
+				deviceName := lookupDeviceName(targetIP)
+				if deviceName == "" {
+					deviceName = "unknown"
+				}
+
+				fmt.Printf("Device found: %s (%s)\n", targetIP, deviceName)
 			}
 		}(ip)
 	}
 
 	wg.Wait()
 	fmt.Println("Scan completed")
+}
+
+func lookupDeviceName(ip string) string {
+	names, err := net.LookupAddr(ip)
+	if err != nil || len(names) == 0 {
+		return ""
+	}
+
+	return strings.TrimSuffix(names[0], ".")
 }
