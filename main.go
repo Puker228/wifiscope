@@ -12,7 +12,13 @@ import (
 )
 
 func main() {
-	subnet := "192.168.31."
+	subnet, err := localSubnet()
+	if err != nil {
+		fmt.Printf("Failed to detect local subnet: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Scanning subnet: %s0/24\n", subnet)
 	var wg sync.WaitGroup
 
 	for i := 1; i < 255; i++ {
@@ -44,6 +50,46 @@ func main() {
 
 	wg.Wait()
 	fmt.Println("Scan completed")
+}
+
+func localSubnet() (string, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+
+			ip := ipNet.IP.To4()
+			if ip == nil || !isPrivateIPv4(ip) {
+				continue
+			}
+
+			return fmt.Sprintf("%d.%d.%d.", ip[0], ip[1], ip[2]), nil
+		}
+	}
+
+	return "", fmt.Errorf("no active private IPv4 address found")
+}
+
+func isPrivateIPv4(ip net.IP) bool {
+	return ip[0] == 10 ||
+		ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31 ||
+		ip[0] == 192 && ip[1] == 168
 }
 
 func lookupDeviceName(ip string) string {
