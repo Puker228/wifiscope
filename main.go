@@ -1,381 +1,82 @@
 package main
 
 import (
-	"encoding/binary"
+	"errors"
+	"flag"
 	"fmt"
-	"net"
+	"os"
 	"strings"
-	"sync"
 	"time"
-
-	"github.com/go-ping/ping"
 )
 
+const defaultPortList = "22,80,139,443,445,3389,5357,8000,8080,8443"
+
 func main() {
-	subnet, err := localSubnet()
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "wifiscope: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	var opts ScanOptions
+
+	flags := flag.NewFlagSet("wifiscope", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+
+	flags.StringVar(&opts.CIDR, "cidr", "", "scan an explicit IPv4 CIDR, for example 192.168.1.0/24")
+	flags.StringVar(&opts.InterfaceName, "iface", "", "scan the IPv4 network assigned to one interface")
+	flags.BoolVar(&opts.AllInterfaces, "all", false, "scan all active local-use IPv4 interfaces")
+	flags.DurationVar(&opts.Timeout, "timeout", 700*time.Millisecond, "per-probe timeout")
+	flags.IntVar(&opts.Workers, "workers", 128, "number of concurrent host workers")
+	portsText := flags.String("ports", defaultPortList, "comma-separated TCP ports used as host-presence probes")
+
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	if opts.Workers < 1 {
+		return fmt.Errorf("--workers must be greater than zero")
+	}
+	if opts.Timeout <= 0 {
+		return fmt.Errorf("--timeout must be greater than zero")
+	}
+
+	ports, err := parsePorts(*portsText)
 	if err != nil {
-		fmt.Printf("Failed to detect local subnet: %v\n", err)
-		return
+		return err
 	}
+	opts.Ports = ports
 
-	fmt.Printf("Scanning subnet: %s0/24\n", subnet)
-	var wg sync.WaitGroup
-
-	for i := 1; i < 255; i++ {
-		ip := fmt.Sprintf("%s%d", subnet, i)
-		wg.Add(1)
-
-		go func(targetIP string) {
-			defer wg.Done()
-
-			pinger, err := ping.NewPinger(targetIP)
-			if err != nil {
-				return
-			}
-			pinger.Count = 1
-			pinger.Timeout = time.Millisecond * 500
-			pinger.Run()
-
-			stats := pinger.Statistics()
-			if stats.PacketsRecv > 0 {
-				deviceName := lookupDeviceName(targetIP)
-				if deviceName == "" {
-					deviceName = "unknown"
-				}
-
-				fmt.Printf("Device found: %s (%s)\n", targetIP, deviceName)
-			}
-		}(ip)
-	}
-
-	wg.Wait()
-	fmt.Println("Scan completed")
-}
-
-func localSubnet() (string, error) {
-	interfaces, err := net.Interfaces()
+	targets, err := discoverNetworkTargets(opts)
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	for _, iface := range interfaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			ipNet, ok := addr.(*net.IPNet)
-			if !ok {
-				continue
-			}
-
-			ip := ipNet.IP.To4()
-			if ip == nil || !isPrivateIPv4(ip) {
-				continue
-			}
-
-			return fmt.Sprintf("%d.%d.%d.", ip[0], ip[1], ip[2]), nil
-		}
-	}
-
-	return "", fmt.Errorf("no active private IPv4 address found")
-}
-
-func isPrivateIPv4(ip net.IP) bool {
-	return ip[0] == 10 ||
-		ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31 ||
-		ip[0] == 192 && ip[1] == 168
-}
-
-func lookupDeviceName(ip string) string {
-	lookups := []func(string) string{
-		lookupReverseDNSName,
-		lookupMDNSName,
-		lookupNetBIOSName,
-	}
-
-	for _, lookup := range lookups {
-		if name := lookup(ip); name != "" {
-			return name
-		}
-	}
-
-	return ""
-}
-
-func lookupReverseDNSName(ip string) string {
-	names, err := net.LookupAddr(ip)
-	if err != nil || len(names) == 0 {
-		return ""
-	}
-
-	return strings.TrimSuffix(names[0], ".")
-}
-
-func lookupMDNSName(ip string) string {
-	reverseName, ok := reverseIPv4Name(ip)
-	if !ok {
-		return ""
-	}
-
-	conn, err := net.ListenPacket("udp4", "0.0.0.0:0")
+	fmt.Printf("Scanning %d network(s): %s\n", len(targets), formatTargets(targets))
+	devices, err := scanNetworks(targets, opts)
 	if err != nil {
-		return ""
-	}
-	defer conn.Close()
-
-	query := buildDNSQuery(reverseName, 12, 0x8001) // PTR, IN with unicast-response bit.
-	mdnsAddr := &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251), Port: 5353}
-	if _, err := conn.WriteTo(query, mdnsAddr); err != nil {
-		return ""
+		return err
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(700 * time.Millisecond))
-	buf := make([]byte, 1500)
-	for {
-		n, _, err := conn.ReadFrom(buf)
-		if err != nil {
-			return ""
-		}
-		if name := parseDNSPTRResponse(buf[:n], reverseName); name != "" {
-			return name
-		}
-	}
-}
-
-func lookupNetBIOSName(ip string) string {
-	targetIP := net.ParseIP(ip).To4()
-	if targetIP == nil {
-		return ""
-	}
-
-	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: targetIP, Port: 137})
-	if err != nil {
-		return ""
-	}
-	defer conn.Close()
-
-	query := buildNetBIOSNodeStatusQuery()
-	if _, err := conn.Write(query); err != nil {
-		return ""
-	}
-
-	_ = conn.SetReadDeadline(time.Now().Add(700 * time.Millisecond))
-	buf := make([]byte, 1500)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return ""
-	}
-
-	return parseNetBIOSNodeStatusResponse(buf[:n])
-}
-
-func reverseIPv4Name(ip string) (string, bool) {
-	parsed := net.ParseIP(ip).To4()
-	if parsed == nil {
-		return "", false
-	}
-
-	return fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa", parsed[3], parsed[2], parsed[1], parsed[0]), true
-}
-
-func buildDNSQuery(name string, queryType uint16, queryClass uint16) []byte {
-	msg := make([]byte, 12, 64)
-	binary.BigEndian.PutUint16(msg[4:6], 1)
-
-	for _, label := range strings.Split(name, ".") {
-		msg = append(msg, byte(len(label)))
-		msg = append(msg, label...)
-	}
-	msg = append(msg, 0)
-	msg = binary.BigEndian.AppendUint16(msg, queryType)
-	msg = binary.BigEndian.AppendUint16(msg, queryClass)
-
-	return msg
-}
-
-func parseDNSPTRResponse(msg []byte, wantedName string) string {
-	if len(msg) < 12 {
-		return ""
-	}
-
-	questionCount := int(binary.BigEndian.Uint16(msg[4:6]))
-	answerCount := int(binary.BigEndian.Uint16(msg[6:8]))
-	authorityCount := int(binary.BigEndian.Uint16(msg[8:10]))
-	additionalCount := int(binary.BigEndian.Uint16(msg[10:12]))
-
-	offset := 12
-	for i := 0; i < questionCount; i++ {
-		_, next, ok := parseDNSName(msg, offset)
-		if !ok || next+4 > len(msg) {
-			return ""
-		}
-		offset = next + 4
-	}
-
-	recordCount := answerCount + authorityCount + additionalCount
-	for i := 0; i < recordCount; i++ {
-		name, next, ok := parseDNSName(msg, offset)
-		if !ok || next+10 > len(msg) {
-			return ""
-		}
-		offset = next
-
-		recordType := binary.BigEndian.Uint16(msg[offset : offset+2])
-		recordLength := int(binary.BigEndian.Uint16(msg[offset+8 : offset+10]))
-		recordStart := offset + 10
-		recordEnd := recordStart + recordLength
-		if recordEnd > len(msg) {
-			return ""
+	for _, device := range devices {
+		name := device.Name
+		if name == "" {
+			name = "unknown"
 		}
 
-		if recordType == 12 && sameDNSName(name, wantedName) {
-			ptrName, _, ok := parseDNSName(msg, recordStart)
-			if ok {
-				return cleanDeviceName(ptrName)
-			}
+		details := []string{"seen: " + strings.Join(device.SeenBy, ",")}
+		if device.NameSource != "" {
+			details = append(details, "name: "+device.NameSource)
 		}
-
-		offset = recordEnd
+		fmt.Printf("Device found: %s (%s) [%s]\n", device.IP, name, strings.Join(details, ", "))
 	}
 
-	return ""
-}
-
-func parseDNSName(msg []byte, offset int) (string, int, bool) {
-	var labels []string
-	next := offset
-	jumped := false
-
-	for jumps := 0; jumps < 16; jumps++ {
-		if offset >= len(msg) {
-			return "", 0, false
-		}
-
-		length := int(msg[offset])
-		if length == 0 {
-			if !jumped {
-				next = offset + 1
-			}
-			return strings.Join(labels, "."), next, true
-		}
-
-		if length&0xC0 == 0xC0 {
-			if offset+1 >= len(msg) {
-				return "", 0, false
-			}
-			pointer := int(binary.BigEndian.Uint16(msg[offset:offset+2]) & 0x3FFF)
-			if !jumped {
-				next = offset + 2
-			}
-			offset = pointer
-			jumped = true
-			continue
-		}
-
-		offset++
-		if offset+length > len(msg) {
-			return "", 0, false
-		}
-		labels = append(labels, string(msg[offset:offset+length]))
-		offset += length
-	}
-
-	return "", 0, false
-}
-
-func sameDNSName(a string, b string) bool {
-	return strings.EqualFold(strings.TrimSuffix(a, "."), strings.TrimSuffix(b, "."))
-}
-
-func buildNetBIOSNodeStatusQuery() []byte {
-	msg := make([]byte, 12, 50)
-	binary.BigEndian.PutUint16(msg[0:2], uint16(time.Now().UnixNano()))
-	binary.BigEndian.PutUint16(msg[4:6], 1)
-
-	msg = append(msg, encodeNetBIOSName("*")...)
-	msg = binary.BigEndian.AppendUint16(msg, 0x0021) // NBSTAT.
-	msg = binary.BigEndian.AppendUint16(msg, 0x0001) // IN.
-
-	return msg
-}
-
-func encodeNetBIOSName(name string) []byte {
-	padded := make([]byte, 16)
-	for i := range padded {
-		padded[i] = ' '
-	}
-	copy(padded, []byte(name))
-
-	encoded := make([]byte, 1, 34)
-	encoded[0] = 32
-	for _, char := range padded {
-		encoded = append(encoded, 'A'+((char>>4)&0x0F), 'A'+(char&0x0F))
-	}
-	encoded = append(encoded, 0)
-
-	return encoded
-}
-
-func parseNetBIOSNodeStatusResponse(msg []byte) string {
-	if len(msg) < 57 {
-		return ""
-	}
-
-	offset := 12
-	for i := 0; i < int(binary.BigEndian.Uint16(msg[4:6])); i++ {
-		_, next, ok := parseDNSName(msg, offset)
-		if !ok || next+4 > len(msg) {
-			return ""
-		}
-		offset = next + 4
-	}
-
-	answerCount := int(binary.BigEndian.Uint16(msg[6:8]))
-	for i := 0; i < answerCount; i++ {
-		_, next, ok := parseDNSName(msg, offset)
-		if !ok || next+10 > len(msg) {
-			return ""
-		}
-		offset = next
-
-		recordType := binary.BigEndian.Uint16(msg[offset : offset+2])
-		recordLength := int(binary.BigEndian.Uint16(msg[offset+8 : offset+10]))
-		recordStart := offset + 10
-		recordEnd := recordStart + recordLength
-		if recordEnd > len(msg) {
-			return ""
-		}
-
-		if recordType == 0x0021 && recordLength > 1 {
-			nameCount := int(msg[recordStart])
-			entryStart := recordStart + 1
-			for j := 0; j < nameCount; j++ {
-				entryOffset := entryStart + j*18
-				if entryOffset+18 > recordEnd {
-					return ""
-				}
-
-				suffix := msg[entryOffset+15]
-				flags := binary.BigEndian.Uint16(msg[entryOffset+16 : entryOffset+18])
-				isGroupName := flags&0x8000 != 0
-				if suffix == 0x00 && !isGroupName {
-					return cleanDeviceName(string(msg[entryOffset : entryOffset+15]))
-				}
-			}
-		}
-
-		offset = recordEnd
-	}
-
-	return ""
-}
-
-func cleanDeviceName(name string) string {
-	return strings.TrimSpace(strings.TrimSuffix(name, "."))
+	fmt.Printf("Scan completed: %d device(s) found\n", len(devices))
+	return nil
 }
